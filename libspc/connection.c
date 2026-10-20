@@ -3,6 +3,7 @@
 #include "serialization.h"
 #include "utils.h"
 #include "connection.h"
+#include "accept.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -164,8 +165,7 @@ spc_connection_t* spc_accept_connection(mach_port_t port)
     ASSERT_MACH_SUCCESS(kr, "mach_msg_recv");
 
     spc_connection_t* connection = malloc(sizeof(spc_connection_t));
-    connection->receive_port = msg.recv_port.name;
-    connection->send_port = msg.send_port.name;
+    ASSERT(spc_accept_message(&msg,msg.header.msgh_size,connection));
 
     return connection;
 }
