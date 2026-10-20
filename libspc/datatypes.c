@@ -29,6 +29,7 @@ void spc_value_destroy(spc_value_t value)
             spc_dictionary_destroy(value.value.dict);
             break;
         case SPC_TYPE_SEND_PORT:
+        case SPC_TYPE_ENDPOINT:
         case SPC_TYPE_RECV_PORT:
         case SPC_TYPE_FD:
             mach_port_deallocate(mach_task_self(), value.value.port.name);

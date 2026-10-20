@@ -235,6 +235,7 @@ void spc_dump_value(spc_value_t value, int indent)
             break;
         }
         case SPC_TYPE_SEND_PORT:
+        case SPC_TYPE_ENDPOINT:
             printf("%*cport send right: %d\n", indent, ' ', value.value.port.name);
             break;
         case SPC_TYPE_RECV_PORT:

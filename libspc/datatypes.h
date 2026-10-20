@@ -23,6 +23,7 @@ typedef struct {
 #define SPC_TYPE_ARRAY        0xe000
 #define SPC_TYPE_DICT         0xf000
 #define SPC_TYPE_RECV_PORT    0x15000
+#define SPC_TYPE_ENDPOINT     0x12000
 
 typedef struct _spc_dictionary_t spc_dictionary_t;
 typedef struct _spc_array_t spc_array_t;

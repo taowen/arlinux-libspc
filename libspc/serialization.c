@@ -146,6 +146,7 @@ size_t spc_serialize_value(writer_t* writer, spc_value_t value)
             break;
         case SPC_TYPE_FD:
         case SPC_TYPE_SEND_PORT:
+        case SPC_TYPE_ENDPOINT:
         case SPC_TYPE_RECV_PORT:
             spc_write_port(writer, value.value.port);
             break;
@@ -375,6 +376,7 @@ spc_value_t spc_deserialize_value(reader_t* reader)
             value.value.dict = spc_deserialize_dict(reader);
             break;
         case SPC_TYPE_SEND_PORT:
+        case SPC_TYPE_ENDPOINT:
             value.value.port = spc_reader_next_port(reader);
             break;
         case SPC_TYPE_RECV_PORT:
