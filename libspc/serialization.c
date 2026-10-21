@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
 
 typedef struct {
     unsigned char* start;
@@ -21,6 +23,8 @@ typedef struct {
     size_t next_port;
     size_t num_ports;
     spc_port_t* ports;
+    int error;
+    unsigned depth;
 } reader_t;
 
 void spc_ensure_space(writer_t* writer, size_t num_bytes)
@@ -253,219 +257,213 @@ spc_mach_message_t* spc_serialize(spc_message_t* msg)
     memcpy(ptr, writer.start, content_size);
 
     free(writer.start);
+    free(writer.ports);
 
     return mach_msg;
 }
 
-void* spc_read(reader_t* reader, size_t len)
+/* All received bytes stay bounded by their transport-supplied span. Decode
+ * errors belong to the message, not to the lifetime of its receiving service. */
+static const void* spc_read(reader_t* reader, size_t bytes)
 {
-    // Let it crash if the received message is invalid...
-    if (reader->ptr + len > reader->end) {
-        printf("OOB read in spc_read\n");
-        abort();
-    }
-
-    void* res = reader->ptr;
-    reader->ptr += len;
-    return res;
-}
-
-uint64_t spc_read_uint64(reader_t* reader)
-{
-    return *(uint64_t*)spc_read(reader, 8);
-}
-
-int64_t spc_read_int64(reader_t* reader)
-{
-    return *(int64_t*)spc_read(reader, 8);
-}
-
-double spc_read_double(reader_t* reader)
-{
-    return *(double*)spc_read(reader, 8);
-}
-
-uint32_t spc_read_uint32(reader_t* reader)
-{
-    return *(uint32_t*)spc_read(reader, 4);
-}
-
-void* spc_read_padded(reader_t* reader, size_t size)
-{
-    size_t remainder = (4 - (size % 4)) % 4;
-
-    return spc_read(reader, size + remainder);
-}
-
-char* spc_read_str(reader_t* reader)
-{
-    unsigned char* end = memchr(reader->ptr, 0, reader->end - reader->ptr);
-    if (!end)
+    if (reader->error || bytes > (size_t)(reader->end - reader->ptr)) {
+        if (!reader->error) reader->error = EINVAL;
         return NULL;
-
-    return spc_read_padded(reader, end - reader->ptr + 1);
-}
-
-spc_port_t spc_reader_next_port(reader_t* reader)
-{
-    if (reader->next_port >= reader->num_ports)
-        return SPC_NULL_PORT;
-
-    reader->next_port++;
-    return reader->ports[reader->next_port - 1];
-}
-
-spc_value_t spc_deserialize_value(reader_t* reader);
-
-spc_array_t* spc_deserialize_array(reader_t* reader)
-{
-    spc_array_t* array = spc_array_create();
-    spc_read_uint32(reader);
-    size_t length = spc_read_uint32(reader);
-    for (uint32_t i = 0; i < length; i++) {
-        spc_value_t value = spc_deserialize_value(reader);
-        spc_array_set_value(array, i, value);
     }
-
-    return array;
+    const void* result = reader->ptr;
+    reader->ptr += bytes;
+    return result;
 }
-
-spc_dictionary_t* spc_deserialize_dict(reader_t* reader)
+static uint32_t spc_read_uint32(reader_t* reader)
 {
-    spc_dictionary_t* dict = spc_dictionary_create();
-    spc_read_uint32(reader);
-    dict->num_items = spc_read_uint32(reader);
-    for (uint32_t i = 0; i < dict->num_items; i++) {
-        spc_dictionary_item_t* item = malloc(sizeof(spc_dictionary_item_t));
-        item->key = strdup(spc_read_str(reader));
-        item->value = spc_deserialize_value(reader);
-        item->next = dict->items;
-        dict->items = item;
+    uint32_t value = 0;
+    const void* bytes = spc_read(reader, sizeof(value));
+    if (bytes) memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+static uint64_t spc_read_uint64(reader_t* reader)
+{
+    uint64_t value = 0;
+    const void* bytes = spc_read(reader, sizeof(value));
+    if (bytes) memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+static const void* spc_read_padded(reader_t* reader, size_t bytes)
+{
+    if (bytes > SIZE_MAX - 3) { reader->error = EINVAL; return NULL; }
+    return spc_read(reader, (bytes + 3) & ~(size_t)3);
+}
+static char* spc_read_key(reader_t* reader)
+{
+    if (reader->error) return NULL;
+    const unsigned char* end = memchr(reader->ptr, 0, reader->end - reader->ptr);
+    if (!end) { reader->error = EINVAL; return NULL; }
+    const char* string = spc_read_padded(reader, end - reader->ptr + 1);
+    if (!string) return NULL;
+    char* result = strdup(string);
+    if (!result) reader->error = ENOMEM;
+    return result;
+}
+static spc_value_t spc_deserialize_value(reader_t* reader);
+
+static spc_value_t spc_deserialize_container(reader_t* reader, uint32_t type)
+{
+    spc_value_t result = spc_null_create();
+    uint32_t size = spc_read_uint32(reader);
+    if (reader->error) return result;
+    if (size < 4 || size > (size_t)(reader->end - reader->ptr)) {
+        reader->error = EINVAL; return result;
     }
-
-    return dict;
+    unsigned char* outer_end = reader->end;
+    reader->end = reader->ptr + size;
+    uint32_t count = spc_read_uint32(reader);
+    size_t minimum = type == SPC_TYPE_ARRAY ? 4 : 8;
+    if (count > (size_t)(reader->end - reader->ptr) / minimum) reader->error = EINVAL;
+    if (!reader->error && type == SPC_TYPE_ARRAY) {
+        spc_array_t* array = spc_array_create();
+        if (!array) { reader->error = ENOMEM; goto done; }
+        result.type = type; result.value.array = array;
+        array->values = calloc(count ? count : 1, sizeof(*array->values));
+        if (!array->values) { reader->error = ENOMEM; goto done; }
+        array->capacity = count;
+        for (uint32_t i = 0; i < count && !reader->error; i++) {
+            spc_value_t value = spc_deserialize_value(reader);
+            array->values[array->length++] = value;
+        }
+    } else if (!reader->error) {
+        spc_dictionary_t* dict = spc_dictionary_create();
+        if (!dict) { reader->error = ENOMEM; goto done; }
+        result.type = type; result.value.dict = dict;
+        for (uint32_t i = 0; i < count && !reader->error; i++) {
+            char* key = spc_read_key(reader);
+            if (!key) break;
+            spc_value_t value = spc_deserialize_value(reader);
+            spc_dictionary_item_t* item = reader->error ? NULL : malloc(sizeof(*item));
+            if (!item) {
+                free(key); spc_value_destroy(value);
+                if (!reader->error) reader->error = ENOMEM;
+                break;
+            }
+            *item = (spc_dictionary_item_t){.key=key,.value=value,.next=dict->items};
+            dict->items = item; dict->num_items++;
+        }
+    }
+    if (!reader->error && reader->ptr != reader->end) reader->error = EINVAL;
+done:
+    reader->end = outer_end;
+    return result;
 }
-
-spc_value_t spc_deserialize_value(reader_t* reader)
+static spc_value_t spc_deserialize_value(reader_t* reader)
 {
-    spc_value_t value;
-    value.type = spc_read_uint32(reader);
-    switch (value.type) {
-        case SPC_TYPE_NULL:
-            break;
+    spc_value_t value = spc_null_create();
+    if (reader->error) return value;
+    if (reader->depth >= 64) { reader->error = EOVERFLOW; return value; }
+    reader->depth++;
+    uint32_t type = spc_read_uint32(reader);
+    if (reader->error) goto done;
+    switch (type) {
+        case SPC_TYPE_NULL: break;
         case SPC_TYPE_BOOL:
-            value.value.u64 = spc_read_uint32(reader);
-            break;
+            value.type = type; value.value.u64 = spc_read_uint32(reader); break;
         case SPC_TYPE_UINT64:
-            value.value.u64 = spc_read_uint64(reader);
-            break;
         case SPC_TYPE_INT64:
-            value.value.i64 = spc_read_int64(reader);
-            break;
         case SPC_TYPE_DOUBLE:
-            value.value.dbl = spc_read_double(reader);
+            value.type = type; value.value.u64 = spc_read_uint64(reader); break;
+        case SPC_TYPE_STRING: {
+            uint32_t size = spc_read_uint32(reader);
+            const char* bytes = size ? spc_read_padded(reader, size) : NULL;
+            if (!bytes || memchr(bytes, 0, size) != bytes + size - 1) {
+                reader->error = EINVAL; break;
+            }
+            char* string = malloc(size);
+            if (!string) { reader->error = ENOMEM; break; }
+            memcpy(string, bytes, size); value.type = type; value.value.str = string;
             break;
-        case SPC_TYPE_STRING:
-            spc_read_uint32(reader);
-            value.value.str = strdup(spc_read_str(reader));
-            break;
+        }
         case SPC_TYPE_ARRAY:
-            value.value.array = spc_deserialize_array(reader);
-            break;
         case SPC_TYPE_DICT:
-            value.value.dict = spc_deserialize_dict(reader);
-            break;
+            value = spc_deserialize_container(reader, type); break;
+        case SPC_TYPE_FD:
         case SPC_TYPE_SEND_PORT:
         case SPC_TYPE_ENDPOINT:
-            value.value.port = spc_reader_next_port(reader);
-            break;
         case SPC_TYPE_RECV_PORT:
-            value.value.port = spc_reader_next_port(reader);
-            break;
-        case SPC_TYPE_UUID:
-            value.value.ptr = malloc(0x10);
-            memcpy(value.value.ptr, spc_read(reader, 0x10), 0x10);
+            if (reader->next_port == reader->num_ports) { reader->error = EINVAL; break; }
+            value.type = type; value.value.port = reader->ports[reader->next_port];
+            reader->ports[reader->next_port++].name = MACH_PORT_NULL;
             break;
         case SPC_TYPE_DATA:
-            value.value.data.size = spc_read_uint32(reader);
-            value.value.data.ptr = malloc(value.value.data.size);
-            memcpy(value.value.data.ptr, spc_read_padded(reader, value.value.data.size), value.value.data.size);
+        case SPC_TYPE_UUID: {
+            uint32_t size = type == SPC_TYPE_UUID ? 16 : spc_read_uint32(reader);
+            const void* bytes = spc_read_padded(reader, size);
+            if (!bytes) break;
+            void* copy = malloc(size ? size : 1);
+            if (!copy) { reader->error = ENOMEM; break; }
+            memcpy(copy, bytes, size); value.type = type;
+            if (type == SPC_TYPE_DATA) value.value.data = (spc_data_t){copy, size};
+            else value.value.ptr = copy;
             break;
-        default:
-            printf("Unsupported value type: 0x%x\n", value.type);
-            exit(-1);
+        }
+        default: reader->error = ENOTSUP; break;
     }
-
+done:
+    reader->depth--;
     return value;
 }
 
-#define MSGID_CONNECTION_INTERRUPTED 71
-
-spc_message_t* spc_deserialize(spc_mach_message_t* mach_msg)
+spc_message_t* spc_deserialize_payload(const mach_msg_header_t* header,
+    const void* payload, size_t length, spc_port_t* ports, size_t count, int* error)
 {
-    reader_t reader;
-    reader.next_port = 0;
-    reader.num_ports = 0;
-    reader.ports = NULL;
-    reader.end = (unsigned char*)mach_msg + mach_msg->header.msgh_size;
-    reader.ptr = mach_msg->buf;
-
-    // Handle well-known message IDs
-    if (mach_msg->header.msgh_id == MSGID_CONNECTION_INTERRUPTED) {
-        spc_dictionary_t* dict = spc_dictionary_create();
-        spc_dictionary_set_string(dict, "error", "Connection interrupted");
-        printf("Connection interrupted\n");
-        // TODO
-        exit(-1);
+    reader_t reader = {.ptr=(unsigned char*)payload,.end=(unsigned char*)payload+length,
+        .ports=ports,.num_ports=count};
+    spc_value_t value = spc_null_create();
+    spc_message_t* result = NULL;
+    const void* magic = spc_read(&reader, 8);
+    if (!magic || memcmp(magic, "CPX@\x05\x00\x00\x00", 8)) reader.error = EINVAL;
+    if (!reader.error) value = spc_deserialize_value(&reader);
+    if (!reader.error && value.type != SPC_TYPE_DICT) reader.error = EINVAL;
+    if (!reader.error && reader.next_port != count) reader.error = EINVAL;
+    if (!reader.error) {
+        result = calloc(1, sizeof(*result));
+        if (!result) reader.error = ENOMEM;
     }
-
-    if (mach_msg->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) {
-        mach_msg_body_t* body = (mach_msg_body_t*)spc_read(&reader, sizeof(mach_msg_body_t));
-        for (int i = 0; i < body->msgh_descriptor_count; i++) {
-            mach_msg_descriptor_type_t type = ((mach_msg_type_descriptor_t*)reader.ptr)->type;
-            switch (type) {
-                case MACH_MSG_PORT_DESCRIPTOR: {
-                    reader.ports = realloc(reader.ports, (reader.num_ports + 1) * sizeof(spc_port_t));
-                    mach_msg_port_descriptor_t* descriptor = (mach_msg_port_descriptor_t*)spc_read(&reader, sizeof(mach_msg_port_descriptor_t));
-                    reader.ports[reader.num_ports].name = descriptor->name;
-                    reader.ports[reader.num_ports].type = descriptor->disposition;
-                    reader.num_ports += 1;
-                    break;
-                }
-                case MACH_MSG_OOL_DESCRIPTOR:
-                    spc_read(&reader, sizeof(mach_msg_ool_descriptor_t));
-                    printf("Warning: ignoring OOL descriptor\n");
-                    break;
-                case MACH_MSG_OOL_PORTS_DESCRIPTOR:
-                    spc_read(&reader, sizeof(mach_msg_ool_ports_descriptor_t));
-                    printf("Warning: ignoring OOL ports descriptor\n");
-                    break;
-                default:
-                    printf("Unsupported mach message descriptor type: %d\n", type);
-                    exit(-1);
-            }
+    if (reader.error) spc_value_destroy(value);
+    else {
+        result->remote_port = (spc_port_t){header->msgh_remote_port,MACH_MSGH_BITS_REMOTE(header->msgh_bits)};
+        result->local_port = (spc_port_t){header->msgh_local_port,MACH_MSGH_BITS_LOCAL(header->msgh_bits)};
+        result->id = header->msgh_id; result->content = value.value.dict;
+    }
+    /* Values own consumed rights. Release unconsumed rights on either outcome. */
+    for (size_t i = 0; i < count; i++) if (ports[i].name) {
+        mach_port_deallocate(mach_task_self(), ports[i].name); ports[i].name = MACH_PORT_NULL;
+    }
+    if (error) *error = reader.error;
+    return result;
+}
+spc_message_t* spc_deserialize(spc_mach_message_t* message)
+{
+    size_t offset = sizeof(message->header), length = message->header.msgh_size;
+    if (length < offset) return NULL;
+    size_t count = 0;
+    spc_port_t* ports = NULL;
+    if (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+        if (length - offset < sizeof(mach_msg_body_t)) return NULL;
+        mach_msg_body_t body; memcpy(&body, (char*)message+offset, sizeof(body));
+        offset += sizeof(body); count = body.msgh_descriptor_count;
+        if (count > (length-offset) / sizeof(mach_msg_port_descriptor_t)) return NULL;
+        ports = calloc(count ? count : 1, sizeof(*ports));
+        if (!ports) return NULL;
+        /* Non-inline transport is owned by the caller via deserialize_payload;
+         * never ignore an OOL descriptor or guess where its data lives. */
+        for (size_t i = 0; i < count; i++) {
+            mach_msg_port_descriptor_t descriptor;
+            memcpy(&descriptor, (char*)message+offset+i*sizeof(descriptor), sizeof(descriptor));
+            if (descriptor.type != MACH_MSG_PORT_DESCRIPTOR) { free(ports); return NULL; }
+            ports[i] = (spc_port_t){descriptor.name,descriptor.disposition};
         }
+        offset += count * sizeof(mach_msg_port_descriptor_t);
     }
-
-    if (memcmp(spc_read(&reader, 8), "CPX@\x05\x00\x00\x00", 8) != 0) {
-        puts("Invalid XPC message header");
-        return NULL;
-    }
-
-    spc_value_t value = spc_deserialize_value(&reader);
-    if (value.type != SPC_TYPE_DICT) {
-        spc_value_destroy(value);
-        puts("Invalid XPC message type");
-        return NULL;
-    }
-
-    spc_message_t* msg = malloc(sizeof(spc_message_t));
-    msg->remote_port.name = mach_msg->header.msgh_remote_port;
-    msg->remote_port.type = MACH_MSGH_BITS_REMOTE(mach_msg->header.msgh_bits);
-    msg->local_port.name = mach_msg->header.msgh_remote_port;
-    msg->local_port.type = MACH_MSGH_BITS_LOCAL(mach_msg->header.msgh_bits);
-    msg->id = mach_msg->header.msgh_id;
-    msg->content = value.value.dict;
-
-    return msg;
+    spc_message_t* result = spc_deserialize_payload(&message->header, (char*)message+offset,
+        length-offset, ports, count, NULL);
+    free(ports);
+    return result;
 }
